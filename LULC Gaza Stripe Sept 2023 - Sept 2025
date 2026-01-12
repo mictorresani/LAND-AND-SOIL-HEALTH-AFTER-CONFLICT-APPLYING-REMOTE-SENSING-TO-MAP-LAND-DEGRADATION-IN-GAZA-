@@ -1,0 +1,177 @@
+
+/***************************************************************
+LAND AND SOIL HEALTH AFTER CONFLICT — APPLYING REMOTE SENSING TO MAP LAND DEGRADATION IN GAZA 
+* Gaza Land-Use — Best single day in September (2023 vs 2025)
+ * Full class area extraction for all DW categories (0–8)
+ * Includes all Dynamic World classes:
+ * 0 Water, 1 Trees, 2 Grass, 3 Flooded vegetation,
+ * 4 Crops, 5 Shrub & scrub, 6 Built, 7 Bare, 8 Snow & ice
+ ***************************************************************/
+
+// ==============
+// 0) AOI
+// ==============
+var aoi = geometry; // your uploaded/drawn Gaza polygon
+
+// ==============
+// 1) Helper functions
+// ==============
+function maskS2sr(img) {
+  var scl = img.select('SCL');
+  var mask = scl.neq(3)  // shadow
+    .and(scl.neq(8))     // cloud medium
+    .and(scl.neq(9))     // cloud high
+    .and(scl.neq(10))    // cirrus
+    .and(scl.neq(11));   // snow/ice
+  return img.updateMask(mask);
+}
+
+function addValidFraction(img) {
+  var validCount = img.select('B2').reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: aoi, scale: 10, maxPixels: 1e13
+  }).get('B2');
+  var totalCount = ee.Image(1).reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: aoi, scale: 10, maxPixels: 1e13
+  }).get('constant');
+  var frac = ee.Number(validCount).divide(ee.Number(totalCount));
+  return img.set('valid_fraction', frac);
+}
+
+function getBestS2September(year) {
+  var start = ee.Date.fromYMD(year, 9, 1);
+  var end   = ee.Date.fromYMD(year, 10, 1);
+  return ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(aoi)
+    .filterDate(start, end)
+    .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 80))
+    .map(maskS2sr)
+    .map(addValidFraction)
+    .sort('valid_fraction', false)
+    .first();
+}
+
+function getDWLabelNearDay(s2img, windowDays) {
+  var t0 = ee.Date(s2img.get('system:time_start'));
+  var start = t0.advance(-windowDays, 'day');
+  var end   = t0.advance(windowDays + 1, 'day');
+  var dwCand = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+    .filterBounds(aoi)
+    .filterDate(start, end)
+    .select('label')
+    .map(function(img){
+      var diff = ee.Number(img.get('system:time_start')).subtract(t0.millis()).abs();
+      return img.set('tDiff', diff);
+    })
+    .sort('tDiff');
+  var hasDW = dwCand.size();
+  var dwClosest = ee.Image(dwCand.first());
+  var yearNum = ee.Number(t0.get('year'));
+  var fallback = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+    .filterBounds(aoi)
+    .filterDate(ee.Date.fromYMD(yearNum, 9, 1),
+                ee.Date.fromYMD(yearNum, 10, 1))
+    .select('label')
+    .mode();
+  return ee.Image(ee.Algorithms.If(hasDW.gt(0), dwClosest, fallback)).clip(aoi);
+}
+
+function areaHa(lulcImg, classId) {
+  var areaImg = ee.Image.pixelArea().divide(10000)
+    .updateMask(lulcImg.eq(classId))
+    .unmask(0);
+  var area = areaImg.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: aoi,
+    scale: 10,
+    maxPixels: 1e13
+  }).get('area');
+  return ee.Number(area);
+}
+
+// ==============
+// 2) Best images
+// ==============
+var best2023 = ee.Image(getBestS2September(2023));
+var best2025 = ee.Image(getBestS2September(2025));
+
+print('Best S2 date 2023-09:', ee.Date(best2023.get('system:time_start')));
+print('Best S2 date 2025-09:', ee.Date(best2025.get('system:time_start')));
+
+var lulc2023 = getDWLabelNearDay(best2023, 7).rename('LULC_2023');
+var lulc2025 = getDWLabelNearDay(best2025, 7).rename('LULC_2025');
+
+// ==============
+// 3) DW classes & palette
+// ==============
+var CLASS = ee.Dictionary({
+  'Water': 0,
+  'Trees': 1,
+  'Grass': 2,
+  'Flooded vegetation': 3,
+  'Crops': 4,
+  'Shrub & scrub': 5,
+  'Built': 6,
+  'Bare': 7,
+  'Snow & ice': 8
+});
+var keys = CLASS.keys();
+
+var dwPalette = [
+  '#419BDF', // 0 water
+  '#397D49', // 1 trees
+  '#88B053', // 2 grass
+  '#7A87C6', // 3 flooded vegetation
+  '#E49635', // 4 crops
+  '#DFC35A', // 5 shrub & scrub
+  '#C4281B', // 6 built
+  '#A59B8F', // 7 bare
+  '#B39FE1'  // 8 snow & ice
+];
+
+// ==============
+// 4) Compute areas for ALL classes
+// ==============
+var areas2023 = ee.Dictionary.fromLists(
+  keys,
+  keys.map(function(k){
+    var id = ee.Number(CLASS.get(k));
+    return areaHa(lulc2023, id);
+  })
+);
+var areas2025 = ee.Dictionary.fromLists(
+  keys,
+  keys.map(function(k){
+    var id = ee.Number(CLASS.get(k));
+    return areaHa(lulc2025, id);
+  })
+);
+
+print('Areas (ha) — Sep 2023 best day', areas2023);
+print('Areas (ha) — Sep 2025 best day', areas2025);
+
+// ==============
+// 5) Optional: bar chart comparing all classes (2023 vs 2025)
+// ==============
+var feat2023 = ee.Feature(null, areas2023.set('Year', 2023));
+var feat2025 = ee.Feature(null, areas2025.set('Year', 2025));
+var fc = ee.FeatureCollection([feat2023, feat2025]);
+
+var chart = ui.Chart.feature.byProperty(fc, 'Year')
+  .setChartType('ColumnChart')
+  .setOptions({
+    title: 'Dynamic World Land-Cover Classes (Gaza — Sep 2023 vs Sep 2025)',
+    hAxis: { title: 'Land-cover class' },
+    vAxis: { title: 'Area (ha)' },
+    colors: dwPalette,
+    legend: { position: 'none' }
+  });
+print(chart);
+
+// ==============
+// 6) Optional map visualization
+// ==============
+Map.centerObject(aoi, 11);
+Map.addLayer(lulc2023, {min:0, max:8, palette: dwPalette}, 'LULC Sep 2023');
+Map.addLayer(lulc2025, {min:0, max:8, palette: dwPalette}, 'LULC Sep 2025');
